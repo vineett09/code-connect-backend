@@ -4,7 +4,7 @@ const axios = require("axios");
 const logger = require("../utils/logger");
 const vectorDBService = require("./vectorDBService");
 const Challenge = require("../models/Challenge");
-const { v4: uuidv4 } = require("uuid"); // Add this import
+const { v4: uuidv4 } = require("uuid");
 
 // Mapping our language names to Judge0 language IDs
 const languageToJudgeId = {
@@ -173,8 +173,11 @@ class DSAChallengeRoomService {
       );
 
       if (cachedResult.found) {
-        // Use cached challenge
         const challenge = cachedResult.challenge;
+        // ✅ ENSURE BOTH IDs ARE SET AND PROPERLY POPULATE MISSING FIELDS
+        challenge.id = challenge.challengeId || uuidv4();
+        challenge.challengeId = challenge.challengeId || challenge.id;
+
         room.setCurrentChallenge(challenge);
 
         logger.log(
@@ -281,8 +284,19 @@ class DSAChallengeRoomService {
     try {
       const response = await axios.post(
         `${config.gemini.baseURL}?key=${process.env.GEMINI_API_KEY}`,
-        { contents: [{ parts: [{ text: prompt }] }] },
-        { headers: { "Content-Type": "application/json" } }
+        {
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.7,
+            topK: 40,
+            topP: 0.95,
+            maxOutputTokens: 4096,
+          },
+        },
+        {
+          headers: { "Content-Type": "application/json" },
+          timeout: 30000,
+        }
       );
 
       const rawText = response.data.candidates[0].content.parts[0].text;
@@ -316,13 +330,6 @@ class DSAChallengeRoomService {
       if (user) {
         user.setCurrentSubmission(result.submission);
       }
-
-      // Automatically evaluate the submission
-      try {
-        await this.evaluateSubmission(roomId, result.submission.id);
-      } catch (error) {
-        logger.error("Error evaluating submission:", error);
-      }
     }
     return result;
   }
@@ -348,20 +355,64 @@ class DSAChallengeRoomService {
 
       if (!submission) throw new Error("Submission not found");
 
-      // Get the function name from the current challenge
+      if (submission.status !== "pending") {
+        logger.log(
+          `Submission ${submissionId} already processed with status: ${submission.status}`
+        );
+        return {
+          success: true,
+          submission: submission,
+          message: "Already processed",
+        };
+      }
+
+      submission.status = "processing";
+      submission.processingStarted = new Date();
+
       const functionName = room.currentChallenge.functionName;
       if (!functionName) {
+        submission.status = "error";
         throw new Error("Function name not found in challenge");
       }
 
+      logger.log(`Starting evaluation for submission ${submissionId}`);
       const result = await this.evaluateWithJudge0(
         submission,
         room.currentChallenge.testCases,
-        functionName
+        functionName,
+        room.currentChallenge
       );
-      return room.updateSubmissionResult(submissionId, result);
+
+      const updateResult = room.updateSubmissionResult(submissionId, result);
+
+      logger.log(
+        `Evaluation completed for submission ${submissionId}: ${result.status}`
+      );
+      return updateResult;
     } catch (error) {
       logger.error("Evaluation error:", error);
+
+      try {
+        const room = this.getRoom(roomId);
+        if (room) {
+          for (const [uid, submissions] of room.userSubmissions.entries()) {
+            const submission = submissions.find(
+              (sub) => sub.id === submissionId
+            );
+            if (submission) {
+              submission.status = "error";
+              submission.error = error.message;
+              break;
+            }
+          }
+        }
+      } catch (updateError) {
+        logger.error(
+          "Failed to update submission status on error:",
+          updateError
+        );
+      }
+
       return {
         success: false,
         message: error.message,
@@ -372,7 +423,12 @@ class DSAChallengeRoomService {
     }
   }
 
-  async evaluateWithJudge0(submission, testCases, functionName) {
+  async evaluateWithJudge0(
+    submission,
+    testCases,
+    functionName,
+    challenge = null
+  ) {
     try {
       if (!submission || !testCases || !functionName) {
         throw new Error("Invalid evaluation data");
@@ -396,14 +452,21 @@ class DSAChallengeRoomService {
         throw new Error("Judge0 configuration is missing");
       }
 
-      // Prepare batch submissions
       const batchSubmissions = testCases.map((testCase, index) => {
-        const wrappedCode = this.createWrappedCode(
-          submission.code,
-          submission.language,
-          testCase,
-          functionName
-        );
+        const wrappedCode = challenge
+          ? this.createWrappedCode(
+              submission.code,
+              submission.language,
+              testCase,
+              functionName,
+              challenge
+            )
+          : this.createWrappedCode(
+              submission.code,
+              submission.language,
+              testCase,
+              functionName
+            );
 
         return {
           language_id: languageId,
@@ -415,7 +478,6 @@ class DSAChallengeRoomService {
         };
       });
 
-      // Submit batch request
       const batchOptions = {
         method: "POST",
         url: `${judge0BaseURL}/submissions/batch`,
@@ -433,10 +495,9 @@ class DSAChallengeRoomService {
       const batchResponse = await axios.request(batchOptions);
       const tokens = batchResponse.data.map((submission) => submission.token);
 
-      // Poll for results with exponential backoff
       let attempts = 0;
       const maxAttempts = 10;
-      let delay = 1000; // Start with 1 second
+      let delay = 1000;
 
       while (attempts < maxAttempts) {
         const resultsOptions = {
@@ -455,13 +516,11 @@ class DSAChallengeRoomService {
         const resultsResponse = await axios.request(resultsOptions);
         const results = resultsResponse.data.submissions;
 
-        // Check if all submissions are completed
         const allCompleted = results.every(
-          (result) => result.status && result.status.id >= 3 // 3 = Accepted, 4+ = Various error states
+          (result) => result.status && result.status.id >= 3
         );
 
         if (allCompleted) {
-          // Process results
           const processedResults = results.map((result, index) => {
             const testCase = testCases[index];
 
@@ -469,27 +528,28 @@ class DSAChallengeRoomService {
               throw new Error("Invalid response from Judge0");
             }
 
-            // Process the actual output
             let actualOutput = "No output";
             if (result.stdout) {
               actualOutput = Buffer.from(result.stdout, "base64")
                 .toString("utf-8")
                 .trim();
-              // Try to parse as JSON to normalize output format
+
               try {
                 const parsed = JSON.parse(actualOutput);
                 actualOutput = JSON.stringify(parsed);
               } catch (e) {
-                // If not JSON, keep as string but clean it
                 actualOutput = actualOutput.replace(/"/g, "");
               }
             }
 
-            // Normalize expected output
             const expectedOutput = JSON.stringify(testCase.output);
-
             const passed =
-              result.status.id === 3 && actualOutput === expectedOutput;
+              result.status.id === 3 &&
+              this.compareOutputs(
+                actualOutput,
+                expectedOutput,
+                challenge?.evaluationType
+              );
 
             return {
               testCase: index + 1,
@@ -523,13 +583,11 @@ class DSAChallengeRoomService {
           };
         }
 
-        // Wait before next poll with exponential backoff
         await new Promise((resolve) => setTimeout(resolve, delay));
-        delay = Math.min(delay * 1.5, 5000); // Cap at 5 seconds
+        delay = Math.min(delay * 1.5, 5000);
         attempts++;
       }
 
-      // If we reach here, polling timed out
       throw new Error(
         "Evaluation timed out - submissions took too long to complete"
       );
@@ -557,7 +615,68 @@ class DSAChallengeRoomService {
     }
   }
 
-  // Helper method to create wrapped code for different languages
+  compareOutputs(actual, expected, testCase = null) {
+    if (actual === expected) return true;
+
+    try {
+      const actualParsed = JSON.parse(actual);
+      const expectedParsed = JSON.parse(expected);
+
+      if (Array.isArray(actualParsed) && Array.isArray(expectedParsed)) {
+        return this.compareArrays(actualParsed, expectedParsed, testCase);
+      }
+
+      if (
+        typeof actualParsed === "object" &&
+        typeof expectedParsed === "object"
+      ) {
+        return JSON.stringify(actualParsed) === JSON.stringify(expectedParsed);
+      }
+
+      if (
+        typeof actualParsed === "number" &&
+        typeof expectedParsed === "number"
+      ) {
+        const tolerance = 1e-9;
+        return Math.abs(actualParsed - expectedParsed) < tolerance;
+      }
+
+      return actualParsed === expectedParsed;
+    } catch (e) {
+      return actual.trim() === expected.trim();
+    }
+  }
+
+  compareArrays(actual, expected, testCase) {
+    if (actual.length !== expected.length) return false;
+
+    const requiresOrder = testCase?.requiresOrder !== false;
+
+    if (requiresOrder) {
+      for (let i = 0; i < actual.length; i++) {
+        if (!this.deepEqual(actual[i], expected[i])) return false;
+      }
+      return true;
+    } else {
+      const sortedActual = [...actual].sort();
+      const sortedExpected = [...expected].sort();
+      return JSON.stringify(sortedActual) === JSON.stringify(sortedExpected);
+    }
+  }
+
+  deepEqual(a, b) {
+    if (a === b) return true;
+    if (typeof a === "number" && typeof b === "number") {
+      return Math.abs(a - b) < 1e-9;
+    }
+    if (Array.isArray(a) && Array.isArray(b)) {
+      return (
+        a.length === b.length && a.every((val, i) => this.deepEqual(val, b[i]))
+      );
+    }
+    return false;
+  }
+
   createWrappedCode(userCode, language, testCase, functionName) {
     const inputJson = JSON.stringify(testCase.input);
     const inputParams = Object.keys(testCase.input);
@@ -685,7 +804,6 @@ func main() {
     if (!room) throw new Error("Room not found");
 
     room.resetChallenge();
-
     return room;
   }
 
@@ -718,13 +836,14 @@ func main() {
 
       for (const [roomId, room] of this.rooms.entries()) {
         let updated = false;
+
         for (let i = room.users.length - 1; i >= 0; i--) {
           const user = room.users[i];
           if (
             user.disconnected &&
             now - user.disconnectedAt > maxDisconnectTime
           ) {
-            room.users.splice(i, 1);
+            this.removeUserPermanently(roomId, user.id);
             updated = true;
           }
         }
@@ -734,6 +853,14 @@ func main() {
           now - room.lastActivity > maxInactiveRoomTime
         ) {
           this.rooms.delete(roomId);
+
+          for (const [socketId, userInfo] of this.users.entries()) {
+            if (userInfo.roomId === roomId) {
+              this.users.delete(socketId);
+            }
+          }
+
+          logger.log(`Cleaned up empty room: ${roomId}`);
         } else if (updated) {
           room.lastActivity = new Date();
         }

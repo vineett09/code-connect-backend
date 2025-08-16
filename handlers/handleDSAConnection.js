@@ -242,7 +242,7 @@ const handleDSAConnection = (io, socket) => {
 
       const challengeId = room.currentChallenge.id;
 
-      // ✅ Block duplicate accepted submissions
+      // ✅ CHECK FOR ALREADY SOLVED
       const alreadySolved = dsaRoomService.hasAlreadySolved(
         roomId,
         user.id,
@@ -258,6 +258,19 @@ const handleDSAConnection = (io, socket) => {
         return;
       }
 
+      // ✅ RATE LIMITING (optional but recommended)
+      const now = Date.now();
+      if (user.lastSubmissionTime && now - user.lastSubmissionTime < 3000) {
+        socket.emit("error", {
+          message: "Please wait before submitting again",
+          code: "RATE_LIMITED",
+          remainingTime: 3000 - (now - user.lastSubmissionTime),
+        });
+        return;
+      }
+      user.lastSubmissionTime = now;
+
+      // ✅ SUBMIT SOLUTION (no automatic evaluation)
       const result = await dsaRoomService.submitSolution(
         roomId,
         user.id,
@@ -268,6 +281,7 @@ const handleDSAConnection = (io, socket) => {
         throw new Error(result.message || "Submission failed");
       }
 
+      // ✅ IMMEDIATE RESPONSE
       socket.emit("solution-submitted", {
         submission: result.submission,
         message: "Solution submitted successfully",
@@ -280,86 +294,113 @@ const handleDSAConnection = (io, socket) => {
         submittedAt: result.submission.submittedAt,
       });
 
-      // NOTIFICATION
       sendNotification(
         roomId,
         "info",
         `${user.name} has submitted a solution.`
       );
 
-      setTimeout(async () => {
-        try {
-          const evaluationResult = await dsaRoomService.evaluateSubmission(
-            roomId,
-            result.submission.id
-          );
+      // ✅ SINGLE EVALUATION CALL WITH PROPER ERROR HANDLING
+      try {
+        logger.log(
+          `Starting evaluation for submission ${result.submission.id}`
+        );
 
-          if (!evaluationResult.success) {
-            throw new Error(evaluationResult.message || "Evaluation failed");
-          }
+        const evaluationResult = await dsaRoomService.evaluateSubmission(
+          roomId,
+          result.submission.id
+        );
 
-          socket.emit("evaluation-result", {
-            submission: evaluationResult.submission,
-            testResults: evaluationResult.submission.testResults,
-          });
-
-          // NEW: Mark challenge as solved if accepted
-          if (
-            evaluationResult.submission.status === "accepted" &&
-            room.currentChallenge?.challengeId
-          ) {
-            try {
-              await dsaRoomService.markChallengeAsSolved(
-                roomId,
-                user.id,
-                room.currentChallenge.challengeId
-              );
-              logger.log(
-                `Challenge ${room.currentChallenge.challengeId} marked as solved by ${user.email}`
-              );
-            } catch (markError) {
-              logger.warn(
-                "Failed to mark challenge as solved:",
-                markError.message
-              );
-              // Don't fail the submission for this
-            }
-          }
-
-          const leaderboard = dsaRoomService.getLeaderboard(roomId);
-          io.to(roomId).emit("leaderboard-updated", {
-            leaderboard,
-            lastSubmission: {
-              userId: user.id,
-              userName: user.name,
-              status: evaluationResult.submission.status,
-              score: evaluationResult.submission.score,
-            },
-          });
-
-          // NOTIFICATION for evaluation result
-          if (evaluationResult.submission.status === "accepted") {
-            sendNotification(
-              roomId,
-              "success",
-              `🎉 ${user.name} passed all test cases!`
-            );
-          } else {
-            sendNotification(
-              roomId,
-              "warning",
-              `${user.name}'s submission failed some test cases.`
-            );
-          }
-        } catch (evalError) {
-          logger.error("Evaluation error:", evalError);
-          socket.emit("error", {
-            message: evalError.message || "Evaluation failed",
-            code: "EVALUATION_ERROR",
-            submissionId: result.submission.id,
-          });
+        if (!evaluationResult.success) {
+          throw new Error(evaluationResult.message || "Evaluation failed");
         }
-      }, 2000);
+
+        // ✅ SEND EVALUATION RESULTS
+        socket.emit("evaluation-result", {
+          submission: evaluationResult.submission,
+          testResults: evaluationResult.submission.testResults,
+        });
+
+        // ✅ MARK CHALLENGE AS SOLVED IF ACCEPTED
+        if (
+          evaluationResult.submission.status === "accepted" &&
+          room.currentChallenge?.challengeId
+        ) {
+          try {
+            await dsaRoomService.markChallengeAsSolved(
+              roomId,
+              user.id,
+              room.currentChallenge.challengeId
+            );
+            logger.log(
+              `Challenge ${room.currentChallenge.challengeId} marked as solved by ${user.email}`
+            );
+          } catch (markError) {
+            logger.warn(
+              "Failed to mark challenge as solved:",
+              markError.message
+            );
+            // Don't fail the submission for this
+          }
+        }
+
+        // ✅ UPDATE LEADERBOARD
+        const leaderboard = dsaRoomService.getLeaderboard(roomId);
+        io.to(roomId).emit("leaderboard-updated", {
+          leaderboard,
+          lastSubmission: {
+            userId: user.id,
+            userName: user.name,
+            status: evaluationResult.submission.status,
+            score: evaluationResult.submission.score,
+          },
+        });
+
+        // ✅ EVALUATION NOTIFICATIONS
+        if (evaluationResult.submission.status === "accepted") {
+          sendNotification(
+            roomId,
+            "success",
+            `🎉 ${user.name} passed all test cases!`
+          );
+        } else if (evaluationResult.submission.status === "error") {
+          sendNotification(
+            roomId,
+            "error",
+            `${user.name}'s submission had an error.`
+          );
+        } else {
+          sendNotification(
+            roomId,
+            "warning",
+            `${user.name}'s submission failed some test cases.`
+          );
+        }
+      } catch (evalError) {
+        logger.error("Evaluation error:", {
+          error: evalError.message,
+          submissionId: result.submission.id,
+          roomId: roomId,
+          userId: user.id,
+        });
+
+        socket.emit("error", {
+          message: evalError.message || "Evaluation failed",
+          code: "EVALUATION_ERROR",
+          submissionId: result.submission.id,
+          details: {
+            canRetry: true,
+            evaluationFailed: true,
+          },
+        });
+
+        // ✅ NOTIFY ROOM OF EVALUATION FAILURE
+        sendNotification(
+          roomId,
+          "error",
+          `Failed to evaluate ${user.name}'s submission.`
+        );
+      }
     } catch (error) {
       logger.error("Submit solution error:", {
         error: error.message,
@@ -367,6 +408,7 @@ const handleDSAConnection = (io, socket) => {
         stack: error.stack,
         data,
       });
+
       socket.emit("error", {
         message: error.message || "Failed to submit solution",
         code: "SUBMISSION_ERROR",
@@ -374,6 +416,7 @@ const handleDSAConnection = (io, socket) => {
           roomId: data?.roomId,
           hasCode: !!data?.solution?.code,
           hasLanguage: !!data?.solution?.language,
+          canRetry: true,
         },
       });
     }

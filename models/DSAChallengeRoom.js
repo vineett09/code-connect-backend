@@ -46,7 +46,8 @@ class DSAChallengeRoom {
 
   setCurrentChallenge(challenge) {
     this.currentChallenge = {
-      id: uuidv4(),
+      id: challenge.id || challenge.challengeId || uuidv4(), // FALLBACK LOGIC
+      challengeId: challenge.challengeId || challenge.id, // ENSURE BOTH EXIST
       ...challenge,
       startTime: new Date(),
       endTime: new Date(Date.now() + this.timeLimit),

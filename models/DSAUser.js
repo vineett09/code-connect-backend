@@ -17,6 +17,7 @@ class DSAUser {
       preferredLanguage: "javascript",
     };
     this.currentSubmission = null;
+    this.lastSubmissionTime = null;
   }
 
   generateColor() {
